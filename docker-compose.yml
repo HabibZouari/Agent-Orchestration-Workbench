@@ -1,9 +1,16 @@
+# Backing services for the distributed mode (TASK_BACKEND=celery, VECTOR_STORE=pgvector).
+# The default local mode needs none of this.
+#
+# Ports bind to loopback only. Override them if they clash with other projects:
+#   REDIS_PORT=6380 POSTGRES_PORT=5433 docker compose up -d
+# (and update REDIS_URL / DATABASE_URL in .env to match).
 services:
   redis:
+    # Redis Stack: LangGraph's Redis checkpointer needs the Search module (FT.* commands).
     image: redis/redis-stack-server:7.4.0-v2
     command: ["redis-stack-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -13,16 +20,16 @@ services:
       retries: 10
 
   postgres:
+    # The application creates its own schema (extension, table, indexes) on first use.
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: agent
       POSTGRES_PASSWORD: agent
       POSTGRES_DB: agent_orchestration
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agent -d agent_orchestration"]
       interval: 5s
