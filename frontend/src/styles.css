@@ -111,6 +111,13 @@ textarea::placeholder, input::placeholder { color: #71817e; }
 .result p { margin: 7px 0 0; color: #c2cec7; font-size: 10px; line-height: 1.55; white-space: pre-wrap; }
 .notice { margin: 10px 0 0; color: var(--mint); font-size: 10px; }
 .notice-error { color: var(--red); }
+.document-list { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); }
+.document-list h3 { margin: 0 0 8px; font-size: 11px; }
+.document-list h3 span { color: var(--dim); font-weight: 400; }
+.document-list ul { margin: 0; padding: 0; list-style: none; max-height: 180px; overflow-y: auto; }
+.document-list li { display: grid; grid-template-columns: minmax(110px, max-content) 1fr; gap: 12px; padding: 6px 0; border-bottom: 1px solid #22323a; font-size: 10px; }
+.document-list code { color: var(--mint); font: 9px "DM Mono", monospace; }
+.document-list li span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .capabilities { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 15px 0 28px; }
 .capabilities > div { display: flex; gap: 10px; padding: 13px; border: 1px solid #2e4047; border-radius: 8px; background: #152129; }
 .cap-icon { color: var(--mint); font-size: 17px; }

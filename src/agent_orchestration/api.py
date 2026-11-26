@@ -1,156 +1,146 @@
 import ipaddress
 import logging
 import secrets
+from typing import Annotated
 from uuid import uuid4
 
-from celery.result import AsyncResult
-from celery.exceptions import OperationalError
-from fastapi import FastAPI, Header, HTTPException, Request
-from redis import Redis
-from redis.exceptions import RedisError
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
-from agent_orchestration.celery_app import celery_app
+from agent_orchestration import __version__
+from agent_orchestration.executors import (
+    ExecutorUnavailableError,
+    TaskExecutor,
+    UnknownTaskError,
+    get_executor,
+)
+from agent_orchestration.retrieval import DocumentStore, StoreUnavailableError, get_store
 from agent_orchestration.schemas import (
     AgentRunRequest,
     AgentRunResponse,
     ApprovalRequest,
+    DocumentSummary,
     DocumentUpsertRequest,
+    HealthResponse,
     SearchRequest,
     SearchResult,
+    TaskStatusResponse,
 )
-from agent_orchestration.settings import get_settings
+from agent_orchestration.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
-app = FastAPI(title="Agent Orchestration API", version="0.1.0")
+app = FastAPI(
+    title="Agent Orchestration API",
+    version=__version__,
+    description="Human-in-the-loop LangGraph agent with hybrid document retrieval.",
+)
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+ExecutorDep = Annotated[TaskExecutor, Depends(get_executor)]
+StoreDep = Annotated[DocumentStore, Depends(get_store)]
 
 
-def _check_worker_services() -> tuple[bool, bool, bool]:
-    return True, True, True
+@app.exception_handler(ExecutorUnavailableError)
+@app.exception_handler(StoreUnavailableError)
+async def _service_unavailable(_: Request, error: Exception) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": str(error)})
 
 
-def _enqueue_task(name: str, args: list[object]):
-    broker_connected, search_available, worker_connected = _check_worker_services()
-    if not broker_connected:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Redis is unavailable. Start Docker Desktop and run "
-                ".\\Start-AgentLab.ps1 before submitting a request."
-            ),
+def _require_ready(executor: TaskExecutor) -> None:
+    health = executor.health()
+    if not health.broker_connected:
+        detail = "Redis is unavailable. Start it with 'docker compose up -d redis'."
+    elif not health.redis_search_available:
+        detail = (
+            "Redis is missing the Search module required for LangGraph checkpoints. "
+            "Use Redis Stack: 'docker compose up -d --force-recreate redis'."
         )
-    if not search_available:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Redis is missing the Search module required for LangGraph "
-                "checkpoints (FT.INFO). Start Redis Stack with "
-                "docker compose up -d --force-recreate redis."
-            ),
-        )
-    if not worker_connected:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "The Celery worker is not responding. Start it with "
-                ".\\Start-AgentLab.ps1 before submitting a request."
-            ),
-        )
-    try:
-        return celery_app.send_task(name, args=args)
-    except OperationalError as error:
-        logger.exception("celery_task_enqueue_failed", extra={"task_name": name})
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "The Redis task queue is unavailable. Start Docker Desktop and "
-                "run the project launcher, then retry."
-            ),
-        ) from error
+    elif not health.worker_connected:
+        detail = "No Celery worker is responding. Start one (see README) and retry."
+    else:
+        return
+    raise HTTPException(status_code=503, detail=detail)
 
 
-@app.get("/health")
-def health() -> dict[str, str | bool]:
-    settings = get_settings()
-    broker_connected, search_available, worker_connected = _check_worker_services()
-    runtime_ready = broker_connected and search_available and worker_connected
-    return {
-        "status": "ok" if runtime_ready else "degraded",
-        "llm_provider": "OmniRoute (OpenAI-compatible)",
-        "llm_model": settings.llm_model,
-        "llm_credential_configured": bool(settings.llm_api_key),
-        "approval_token_required": bool(settings.approval_api_key),
-        "broker_connected": broker_connected,
-        "redis_search_available": search_available,
-        "worker_connected": worker_connected,
-    }
+@app.get("/health", response_model=HealthResponse)
+def health(settings: SettingsDep, executor: ExecutorDep) -> HealthResponse:
+    runtime = executor.health()
+    return HealthResponse(
+        status="ok" if runtime.ready else "degraded",
+        version=__version__,
+        task_backend=settings.task_backend,
+        vector_store=settings.vector_store,
+        llm_provider="OpenAI-compatible",
+        llm_model=settings.llm_model,
+        llm_credential_configured=bool(settings.llm_api_key),
+        approval_token_required=bool(settings.approval_api_key),
+        broker_connected=runtime.broker_connected,
+        redis_search_available=runtime.redis_search_available,
+        worker_connected=runtime.worker_connected,
+    )
 
 
 @app.post("/agents/run", response_model=AgentRunResponse, status_code=202)
-def submit_agent_run(body: AgentRunRequest) -> AgentRunResponse:
+def submit_agent_run(body: AgentRunRequest, executor: ExecutorDep) -> AgentRunResponse:
+    _require_ready(executor)
     thread_id = body.thread_id or str(uuid4())
-    task = _enqueue_task(
-        "agent_orchestration.run",
-        [body.request, thread_id],
-    )
-    return AgentRunResponse(task_id=task.id, thread_id=thread_id, status="queued")
+    task_id = executor.submit_run(body.request, thread_id)
+    return AgentRunResponse(task_id=task_id, thread_id=thread_id)
 
 
-@app.get("/tasks/{task_id}")
-def get_task(task_id: str) -> dict[str, object]:
-    from agent_orchestration.tasks import _TASK_STORE
-    task = _TASK_STORE.get(task_id, {"status": "PENDING"})
-    status = task.get("status", "PENDING")
-    # Map to Celery-style status names expected by frontend ("SUCCESS", "FAILURE", "PENDING", "STARTED")
-    response: dict[str, object] = {"task_id": task_id, "status": status}
-    if status == "SUCCESS":
-        response["result"] = task.get("result")
-    elif status == "FAILURE":
-        response["error"] = task.get("error")
-    return response
+@app.get("/tasks/{task_id}", response_model=TaskStatusResponse)
+def get_task(task_id: str, executor: ExecutorDep) -> TaskStatusResponse:
+    try:
+        return executor.status(task_id)
+    except UnknownTaskError as error:
+        raise HTTPException(status_code=404, detail="Unknown task ID.") from error
 
 
-@app.post("/agents/{thread_id}/approval", status_code=202)
+def _authorize_approval(request: Request, token: str | None, settings: Settings) -> None:
+    expected = settings.approval_api_key
+    if expected:
+        if not token or not secrets.compare_digest(token.encode(), expected.encode()):
+            raise HTTPException(status_code=401, detail="Invalid approval token.")
+        return
+    client_host = request.client.host if request.client else ""
+    try:
+        is_local = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        is_local = False
+    if not is_local:
+        raise HTTPException(
+            status_code=403,
+            detail="Configure APPROVAL_API_KEY before approving over a network.",
+        )
+
+
+@app.post("/agents/{thread_id}/approval", response_model=AgentRunResponse, status_code=202)
 def submit_approval(
     thread_id: str,
     body: ApprovalRequest,
     request: Request,
-    x_approval_token: str | None = Header(default=None),
-) -> dict[str, str]:
-    expected_token = get_settings().approval_api_key
-    if expected_token:
-        if not x_approval_token or not secrets.compare_digest(
-            x_approval_token,
-            expected_token,
-        ):
-            raise HTTPException(status_code=401, detail="Invalid approval token.")
-    else:
-        client_host = request.client.host if request.client else ""
-        try:
-            is_local = ipaddress.ip_address(client_host).is_loopback
-        except ValueError:
-            is_local = False
-        if not is_local:
-            raise HTTPException(
-                status_code=403,
-                detail="Configure APPROVAL_API_KEY before approving over a network.",
-            )
-    task = _enqueue_task(
-        "agent_orchestration.resume",
-        [thread_id, body.approved],
-    )
-    return {"task_id": task.id, "thread_id": thread_id, "status": "queued"}
+    settings: SettingsDep,
+    executor: ExecutorDep,
+    x_approval_token: Annotated[str | None, Header()] = None,
+) -> AgentRunResponse:
+    _authorize_approval(request, x_approval_token, settings)
+    _require_ready(executor)
+    task_id = executor.submit_resume(thread_id, body.approved)
+    return AgentRunResponse(task_id=task_id, thread_id=thread_id)
+
+
+@app.get("/documents", response_model=list[DocumentSummary])
+def list_documents(
+    store: StoreDep, limit: Annotated[int, Query(ge=1, le=500)] = 100
+) -> list[DocumentSummary]:
+    return store.list_documents(limit)
 
 
 @app.put("/documents")
-def index_documents(body: DocumentUpsertRequest) -> dict[str, int]:
-    from agent_orchestration.retrieval import upsert_documents
-
-    count = upsert_documents(body.documents)
-    return {"indexed": count}
+def index_documents(body: DocumentUpsertRequest, store: StoreDep) -> dict[str, int]:
+    return {"indexed": store.upsert(body.documents)}
 
 
 @app.post("/search", response_model=list[SearchResult])
-def search(body: SearchRequest) -> list[SearchResult]:
-    from agent_orchestration.retrieval import search_documents
-
-    return search_documents(body.query, body.top_k)
+def search(body: SearchRequest, store: StoreDep) -> list[SearchResult]:
+    return store.search(body.query, body.top_k)
