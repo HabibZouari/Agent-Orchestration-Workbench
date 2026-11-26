@@ -1,117 +1,192 @@
-# Agent Orchestration System
+# Agent Orchestration Workbench
 
-A local React + FastAPI workbench for testing an OmniRoute-powered LangGraph agent.
-Celery runs agent jobs, Redis stores graph checkpoints, and PostgreSQL/pgvector
-provides hybrid document search.
+[![CI](https://github.com/HabibZouari/Agent-Orchestration-Workbench/actions/workflows/ci.yml/badge.svg)](https://github.com/HabibZouari/Agent-Orchestration-Workbench/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## What the agent is supposed to do
+A human-in-the-loop AI agent built with **LangGraph**, **FastAPI**, and **React**.
+The agent plans, calls tools, and **pauses for human approval before any destructive
+action**. It answers questions over an internal knowledge base using **hybrid
+retrieval** (keyword + semantic search fused with Reciprocal Rank Fusion).
 
-The agent follows a plan → act → reflect workflow. Its registered tools are
-limited to:
+The same code runs in two modes, chosen in `.env`:
 
-- **Search internal documents:** keyword and semantic retrieval over documents
-  you explicitly index.
-- **Delete an internal document:** requires your approval in the React app
-  before the deletion tool runs.
+| | **Local mode** (default) | **Distributed mode** |
+|---|---|---|
+| Task execution | Thread pool inside the API | **Celery** workers over **Redis** |
+| Agent checkpoints | In memory | **Redis Stack** (survive restarts, shared by workers) |
+| Document store | **SQLite**: FTS5 BM25 + NumPy cosine | **PostgreSQL**: full-text search + **pgvector** HNSW |
+| Needs | Python + Node | + Docker (`docker compose up -d`) |
 
-It can also answer general questions through the configured OmniRoute model. It
-cannot browse the web, read files from your computer, or run shell commands.
-The app displays the generated plan, task status, any pending approval, and the
-final answer.
+## How it works
 
-## Start the app on Windows
-
-Prerequisites: Docker Desktop, Node.js (npm included), Python 3.11+, and an
-OmniRoute API key with access to an OpenAI-compatible chat-completions API.
-Docker is only the convenient local way this project starts Redis Stack and
-PostgreSQL; React and FastAPI do not require Docker if you provide compatible
-services yourself and configure `REDIS_URL` and `DATABASE_URL` in `.env`.
-
-1. If this is the first run, create the private environment file:
-
-   ```powershell
-   Copy-Item .env.example .env
-   notepad .env
-   ```
-
-   Set `LLM_API_KEY` to your OmniRoute key. `LLM_BASE_URL` is
-   `http://localhost:20128/v1`. Verify `LLM_MODEL` matches an enabled model ID in
-   your OmniRoute account. Keep the key only in `.env`, never in source code or
-   chat.
-
-2. From the project folder run:
-
-   ```powershell
-   .\Start-AgentLab.ps1
-   ```
-
-   The launcher starts Redis Stack and PostgreSQL with Docker Compose, installs
-   the Python and React dependencies if needed, starts the Celery worker and
-   FastAPI, then starts Vite. Open **http://127.0.0.1:5173** while the launcher
-   is running. The React dev server proxies API requests to FastAPI on port 8000.
-
-   If PowerShell blocks the script, use this for the current terminal only:
-
-   ```powershell
-   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-   .\Start-AgentLab.ps1
-   ```
-
-### Test a full agent run
-
-1. Confirm the top of the app says **API online** and the model key is
-   configured. If not, check `.env` and restart the launcher.
-2. Enter a general question and click **Run agent**. When the request completes,
-   the run trace shows the plan and model response.
-3. To test retrieval, use **Documents & hybrid search** to index a small,
-   non-sensitive sample document. Search for a phrase in that document.
-4. Ask the agent to search for that same topic. The agent should call its
-   internal search tool and summarize the retrieved text.
-5. To test human approval, index a disposable sample with ID `demo-policy`, then
-   ask: `Delete the internal document with ID demo-policy.` Review the proposed
-   tool call and click **Approve action** or **Reject action**. Rejection must
-   not delete the document.
-
-Do not use sensitive data for these first tests. A successful UI load does not
-guarantee the model provider is available; if OmniRoute returns an error, check
-the provider dashboard and the Celery worker window.
-
-## Local database and embeddings
-
-You do **not** need to open PostgreSQL or create a database manually. Compose
-creates a local `agent_orchestration` database, document table, pgvector
-extension, and Redis Stack service. Redis Stack is required because LangGraph's
-Redis checkpointer uses Redis Search commands such as `FT.INFO`; plain Redis
-does not provide them. PostgreSQL and Redis data persist in Docker volumes. Do
-not use `docker compose down -v` unless you intend to erase that local data.
-
-If you started the project before Redis Stack was configured and see
-`unknown command 'FT.INFO'`, replace the existing Redis container from the
-project folder:
-
-```powershell
-docker compose pull redis
-docker compose up -d --force-recreate redis
+```mermaid
+flowchart LR
+    UI[React workbench] -->|REST| API[FastAPI]
+    API -->|submit / poll| EX{{TaskExecutor}}
+    EX -->|local| TP[Thread pool]
+    EX -->|celery| Q[(Redis broker)] --> W[Celery worker]
+    TP & W --> G[LangGraph agent]
+    G <-->|checkpoints| CP[(Memory / Redis Stack)]
+    G -->|tools| S{{DocumentStore}}
+    API -->|index / search| S
+    S --> SQ[(SQLite + FTS5)]
+    S --> PG[(PostgreSQL + pgvector)]
+    G -->|chat completions| LLM[OpenAI-compatible LLM]
 ```
 
-This recreates only the Redis container; it does not remove named data volumes.
-If you still have checkpoint data in an older Redis container that had no
-persistent volume, that container's data may not survive recreation. Restart
-`.\Start-AgentLab.ps1` afterward. The app health status checks Redis, its Search
-module, and the Celery worker separately.
+The agent is a LangGraph state machine:
 
-The first indexing/search request downloads `BAAI/bge-small-en-v1.5`
-automatically through FastEmbed. It produces the 384-dimensional vectors the
-database expects; no manual model download is needed.
+```mermaid
+flowchart LR
+    START --> plan --> act
+    act -->|no tool calls| reflect
+    act -->|tool calls| gate[approval gate]
+    gate -->|low risk, or approved| tools --> reflect
+    gate -->|rejected| denied[deny tool calls] --> reflect
+    reflect --> END
+```
 
-## Configuration and API
+1. **Plan**: the model writes a short, structured plan (validated with Pydantic).
+2. **Act**: the model chooses tools. Each tool has a declared risk level, and any
+   tool without one is treated as high risk.
+3. **Approval gate**: for high-risk calls, the graph `interrupt()`s. Its state is
+   checkpointed, and the API returns the exact tool call (name and arguments) for
+   review. Approving or rejecting resumes the same thread, possibly on a different
+   worker.
+4. **Reflect**: the model summarises what happened, including denied actions.
 
-`.env.example` has placeholders only. The project reads `LLM_API_KEY`,
-`LLM_BASE_URL`, `LLM_MODEL`, `REDIS_URL`, `DATABASE_URL`, and `EMBEDDING_MODEL`.
-This project uses OmniRoute; it does not require an Anthropic key. An
-`APPROVAL_API_KEY` is optional for loopback development, and required for
-approval requests from non-local clients.
+The agent's tools are `search_internal_documents` (low risk) and
+`delete_internal_document` (high risk). It has no shell, file-system, or web access.
 
-FastAPI docs are at `http://127.0.0.1:8000/docs`. Keep the API and React
-development server on loopback; do not expose this development setup to a
-network without adding appropriate authentication and authorization.
+### Hybrid retrieval
+
+Each query runs two retrievers. One is keyword search (SQLite FTS5 BM25 with Porter
+stemming, or PostgreSQL `ts_rank_cd`). The other is semantic search over
+`BAAI/bge-small-en-v1.5` embeddings (FastEmbed, run locally on CPU). Their rankings
+are merged with Reciprocal Rank Fusion, `score = Σ 1 / (60 + rank)`, so scores are
+comparable across backends without tuning weights.
+
+## Quick start
+
+**Prerequisites:** Python 3.11+, Node.js 20+, and an API key for any
+OpenAI-compatible chat-completions endpoint (OpenAI, OmniRoute, vLLM, Ollama, ...).
+Docker is only needed for distributed mode.
+
+```powershell
+Copy-Item .env.example .env    # then set LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+.\Start-AgentLab.ps1           # Windows: installs deps, starts API + UI
+```
+
+Open **http://127.0.0.1:5173**. The launcher reads `TASK_BACKEND` and `VECTOR_STORE`
+from `.env`. In distributed mode it also starts Redis Stack and PostgreSQL with
+Docker Compose and opens a Celery worker window. If port 8000 is busy, run
+`.\Start-AgentLab.ps1 -ApiPort 8010`.
+
+<details>
+<summary>Manual start (macOS / Linux / any shell)</summary>
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env                       # set LLM_API_KEY etc.
+
+uvicorn agent_orchestration.api:app --port 8000          # terminal 1
+cd frontend && npm ci && npm run dev                     # terminal 2
+
+# Distributed mode: set TASK_BACKEND=celery and VECTOR_STORE=pgvector in .env, then
+docker compose up -d
+celery -A agent_orchestration.celery_app worker --loglevel=info   # terminal 3
+```
+</details>
+
+### Try it
+
+Three sample documents are indexed on first start: `demo-policy`,
+`security-guidelines`, and `agent-playbook`.
+
+1. **Search**: *"Search our internal documents for the data-retention policy and
+   summarize it."* The agent calls the search tool without asking.
+2. **Approval**: *"Delete the internal document with ID demo-policy."* The run pauses
+   and shows the proposed tool call. **Reject** leaves the document in place, and
+   **Approve** deletes it. The document list updates either way.
+3. **Retrieval only**: index your own text in the RAG sandbox and search it directly.
+
+## API
+
+Interactive docs are served at `http://127.0.0.1:8000/docs`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Mode, model, and the state of Redis, RediSearch, and the worker |
+| `POST` | `/agents/run` | Queue a request: `{request, thread_id?}` → `202 {task_id, thread_id}` |
+| `GET` | `/tasks/{task_id}` | `PENDING` / `STARTED` / `SUCCESS` (`result`) / `FAILURE` (`error`) |
+| `POST` | `/agents/{thread_id}/approval` | Resume a paused run: `{approved: bool}` |
+| `GET` | `/documents` | List indexed documents |
+| `PUT` | `/documents` | Upsert up to 100 documents: `{documents: [{id, content, metadata}]}` |
+| `POST` | `/search` | Hybrid search: `{query, top_k}` |
+
+A paused run returns `result.status = "awaiting_approval"` and `result.interrupts`
+with the tool calls to review. Approving a thread that is not paused fails safely.
+Runs on the same thread are serialized (with a Redis lock in distributed mode), so a
+double-clicked approval cannot execute an action twice.
+
+## Configuration
+
+All settings come from environment variables or `.env`. See [.env.example](.env.example).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | none / `localhost:20128/v1` / `gemma-2-2b` | Any OpenAI-compatible endpoint |
+| `TASK_BACKEND` | `local` | `local` or `celery` |
+| `REDIS_URL` | `redis://localhost:6379/0` | Must use db `0`, because RediSearch only indexes db 0 |
+| `VECTOR_STORE` | `sqlite` | `sqlite` or `pgvector` |
+| `SQLITE_PATH` / `DATABASE_URL` | `data/documents.db` / local Compose Postgres | |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `BAAI/bge-small-en-v1.5` / `384` | Downloaded once on first use |
+| `SEED_SAMPLE_DOCUMENTS` | `true` | Index the three samples when the store is empty |
+| `APPROVAL_API_KEY` | empty | If set, approvals need the `X-Approval-Token` header. If empty, only loopback clients can approve |
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest -m "not integration"        # fast, offline: fake LLM + hashing embedder
+ruff check src tests && ruff format --check src tests
+
+# Integration tests against real Redis Stack, a Celery worker, and pgvector:
+docker compose up -d
+TEST_DATABASE_URL=postgresql://agent:agent@localhost:5432/agent_orchestration \
+TEST_REDIS_URL=redis://localhost:6379/0 pytest -m integration
+```
+
+The unit tests drive the real LangGraph workflow with a scripted chat model. They
+cover the full approve and reject paths, double-approval protection, follow-up
+requests on a thread, hybrid ranking, and the API's authorization rules. CI runs
+lint, unit tests, and integration tests (on Python 3.11 and 3.12), plus the
+frontend build.
+
+```
+src/agent_orchestration/
+├── api.py          FastAPI routes; executor and store injected as dependencies
+├── graph.py        LangGraph workflow, checkpointer selection, run/resume
+├── executors.py    LocalExecutor (thread pool) and CeleryExecutor behind one interface
+├── celery_app.py   Celery app and tasks (with per-thread Redis lock)
+├── retrieval.py    SQLiteStore, PgVectorStore, and Reciprocal Rank Fusion
+├── tools.py        Agent tools and their risk levels
+├── schemas.py      Request and response models
+└── settings.py     Typed configuration (pydantic-settings)
+frontend/           React + Vite workbench
+tests/              Unit tests (offline) and integration tests (live services)
+```
+
+## Security notes
+
+This is a local development workbench. The API, UI, and Compose services bind to
+`127.0.0.1`. Approvals are restricted to loopback clients unless `APPROVAL_API_KEY`
+is set. Secrets stay in `.env`, which git ignores, and `/health` reports only
+whether a key is configured. Do not expose this setup to a network without adding
+real authentication.
+
+## License
+
+[MIT](LICENSE)
