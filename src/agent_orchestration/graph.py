@@ -1,11 +1,22 @@
+"""LangGraph workflow: plan -> act -> (approval gate) -> tools -> reflect."""
+
 import logging
-from typing import Annotated, TypedDict
+import threading
+from collections.abc import Sequence
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.runnables import RunnableConfig
-from langchain_openai import ChatOpenAI
+from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -18,16 +29,8 @@ from agent_orchestration.tools import TOOL_RISK, build_tools
 logger = logging.getLogger(__name__)
 
 
-def _build_model() -> BaseChatModel:
-    settings = get_settings()
-    if not settings.llm_api_key:
-        raise ValueError("LLM_API_KEY must be configured for the OmniRoute provider.")
-    return ChatOpenAI(
-        model=settings.llm_model,
-        api_key=settings.llm_api_key,
-        base_url=settings.llm_base_url,
-        temperature=0,
-    )
+class NoPendingApprovalError(LookupError):
+    """Raised when resuming a thread that is not waiting for approval."""
 
 
 class AgentPlan(BaseModel):
@@ -43,9 +46,36 @@ class AgentState(TypedDict, total=False):
     approval_granted: bool
 
 
-def build_graph(checkpointer: BaseCheckpointSaver):
-    model = _build_model()
-    tools = build_tools()
+def _build_model() -> BaseChatModel:
+    from langchain_openai import ChatOpenAI
+
+    settings = get_settings()
+    if not settings.llm_api_key:
+        raise ValueError("LLM_API_KEY must be configured for the OpenAI-compatible provider.")
+    return ChatOpenAI(
+        model=settings.llm_model,
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+        temperature=0,
+    )
+
+
+def _latest_request(messages: Sequence[BaseMessage]) -> HumanMessage:
+    """The newest user message, so follow-up requests on a thread are handled."""
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return message
+    return HumanMessage(content="")
+
+
+def build_graph(
+    checkpointer: BaseCheckpointSaver,
+    *,
+    model: BaseChatModel | None = None,
+    tools: list[BaseTool] | None = None,
+):
+    model = model if model is not None else _build_model()
+    tools = tools if tools is not None else build_tools()
     model_with_tools = model.bind_tools(tools)
     tool_executor = ToolNode(tools)
 
@@ -60,59 +90,46 @@ def build_graph(checkpointer: BaseCheckpointSaver):
         )
 
     def plan_node(state: AgentState, config: RunnableConfig) -> dict[str, object]:
-        request = next(
-            (message.content for message in state["messages"] if isinstance(message, HumanMessage)),
-            "",
-        )
-        plan = model.with_structured_output(
-            AgentPlan,
-            method="json_schema",
-        ).invoke(
+        request = _latest_request(state["messages"])
+        plan = model.with_structured_output(AgentPlan, method="json_schema").invoke(
             [
                 SystemMessage(
                     content="Create a concise, safe execution plan. Do not execute actions."
                 ),
-                HumanMessage(content=str(request)),
+                HumanMessage(content=str(request.content)),
             ]
         )
         log_step("plan", config, step_count=len(plan.steps))
         return {"plan": plan}
 
     def act_node(state: AgentState, config: RunnableConfig) -> dict[str, object]:
-        request = next(
-            (message for message in state["messages"] if isinstance(message, HumanMessage)),
-            HumanMessage(content=""),
-        )
         response = model_with_tools.invoke(
             [
                 SystemMessage(
                     content=(
                         "Carry out the request using the available tools. "
-                        "You have access to the tool 'search_internal_documents' to search internal documents, "
-                        "and 'delete_internal_document' to delete documents. "
-                        "When the user asks to search documents, policies, or internal information, you MUST call "
-                        "the 'search_internal_documents' tool. Do not claim you lack access to internal documents. "
-                        "Do not claim an action succeeded unless a tool confirms it. "
+                        "Use 'search_internal_documents' to search internal documents and "
+                        "'delete_internal_document' to delete one. When the user asks about "
+                        "documents, policies, or internal information, you MUST call "
+                        "'search_internal_documents'. Do not claim you lack access to internal "
+                        "documents. Do not claim an action succeeded unless a tool confirms it. "
                         f"Execution plan: {state['plan'].model_dump_json()}"
                     )
                 ),
-                request,
+                _latest_request(state["messages"]),
             ]
         )
-        log_step(
-            "act",
-            config,
-            tool_names=[call["name"] for call in response.tool_calls],
-        )
+        log_step("act", config, tool_names=[call["name"] for call in response.tool_calls])
         return {"messages": [response], "approval_required": False, "approval_granted": False}
 
     def approval_gate_node(state: AgentState, config: RunnableConfig) -> dict[str, object]:
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage):
-            raise TypeError("Expected an AIMessage with tool calls at approval gate.")
-        calls = last_message.tool_calls
+            raise TypeError("Expected an AIMessage with tool calls at the approval gate.")
         high_risk_calls = [
-            call for call in calls if TOOL_RISK.get(call["name"], "high") == "high"
+            call
+            for call in last_message.tool_calls
+            if TOOL_RISK.get(call["name"], "high") == "high"
         ]
         if not high_risk_calls:
             log_step("approval_gate", config, required=False)
@@ -128,28 +145,24 @@ def build_graph(checkpointer: BaseCheckpointSaver):
             {
                 "reason": "High-risk tool call requires human approval.",
                 "tool_calls": [
-                    {"name": call["name"], "arguments": call["args"]}
-                    for call in high_risk_calls
+                    {"name": call["name"], "arguments": call["args"]} for call in high_risk_calls
                 ],
             }
         )
         approved = (
-            decision.get("approved", False)
-            if isinstance(decision, dict)
-            else bool(decision)
+            bool(decision.get("approved", False)) if isinstance(decision, dict) else bool(decision)
         )
         log_step("approval_decision", config, approved=approved)
         return {"approval_required": True, "approval_granted": approved}
 
     def denied_tools_node(state: AgentState, config: RunnableConfig) -> dict[str, object]:
+        # A rejected batch is denied as a whole: every pending tool call gets a
+        # "not approved" result so the model never sees a dangling tool call.
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage):
-            raise TypeError("Expected an AIMessage with tool calls at approval gate.")
+            raise TypeError("Expected an AIMessage with tool calls at the approval gate.")
         denied = [
-            ToolMessage(
-                content="Action was not approved by a human.",
-                tool_call_id=call["id"],
-            )
+            ToolMessage(content="Action was not approved by a human.", tool_call_id=call["id"])
             for call in last_message.tool_calls
         ]
         log_step("tool_execution_denied", config, count=len(denied))
@@ -158,7 +171,7 @@ def build_graph(checkpointer: BaseCheckpointSaver):
     def tools_node(state: AgentState, config: RunnableConfig) -> dict[str, object]:
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage):
-            raise TypeError("Expected an AIMessage with tool calls at tool executor.")
+            raise TypeError("Expected an AIMessage with tool calls at the tool executor.")
         tool_names = [call["name"] for call in last_message.tool_calls]
         try:
             result = tool_executor.invoke(state, config)
@@ -191,7 +204,8 @@ def build_graph(checkpointer: BaseCheckpointSaver):
 
     def route_after_act(state: AgentState) -> str:
         message = state["messages"][-1]
-        return "approval_gate" if isinstance(message, AIMessage) and message.tool_calls else "reflect"
+        has_calls = isinstance(message, AIMessage) and message.tool_calls
+        return "approval_gate" if has_calls else "reflect"
 
     def route_after_gate(state: AgentState) -> str:
         if state.get("approval_required") and not state.get("approval_granted"):
@@ -207,40 +221,73 @@ def build_graph(checkpointer: BaseCheckpointSaver):
     builder.add_node("reflect", reflect_node)
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "act")
-    builder.add_conditional_edges("act", route_after_act)
-    builder.add_conditional_edges("approval_gate", route_after_gate)
+    builder.add_conditional_edges("act", route_after_act, ["approval_gate", "reflect"])
+    builder.add_conditional_edges("approval_gate", route_after_gate, ["tools", "denied_tools"])
     builder.add_edge("tools", "reflect")
     builder.add_edge("denied_tools", "reflect")
     builder.add_edge("reflect", END)
     return builder.compile(checkpointer=checkpointer)
 
 
-# Global in-memory checkpointer so threads persist in memory during the session
-from langgraph.checkpoint.memory import InMemorySaver
-_global_checkpointer = InMemorySaver()
+def create_checkpointer() -> BaseCheckpointSaver:
+    """In-memory checkpoints for the local backend; Redis when work is distributed.
 
-def run_graph(request: str, thread_id: str, resume: object | None = None) -> dict[str, object]:
-    graph = build_graph(_global_checkpointer)
-    config = {"configurable": {"thread_id": thread_id}}
-    if resume is not None:
-        result = graph.invoke(Command(resume=resume), config=config)
-    else:
-        result = graph.invoke(
-            {"messages": [HumanMessage(content=request)]},
-            config=config,
-        )
+    Celery workers run in separate processes, so a paused thread must be stored
+    somewhere every worker can read when the approval decision arrives.
+    """
+    settings = get_settings()
+    if settings.task_backend == "celery":
+        from langgraph.checkpoint.redis import RedisSaver
 
+        saver = RedisSaver(redis_url=settings.redis_url)
+        saver.setup()
+        return saver
+    return InMemorySaver()
+
+
+_graph_lock = threading.Lock()
+_graph: Any = None
+
+
+def get_graph():
+    """Compile the workflow once per process."""
+    global _graph
+    with _graph_lock:
+        if _graph is None:
+            _graph = build_graph(create_checkpointer())
+        return _graph
+
+
+def _summarize(thread_id: str, result: dict[str, Any]) -> dict[str, object]:
+    plan = result["plan"].model_dump()
     interrupts = result.get("__interrupt__", [])
     if interrupts:
         return {
             "status": "awaiting_approval",
             "thread_id": thread_id,
-            "plan": result["plan"].model_dump(),
+            "plan": plan,
             "interrupts": [item.value for item in interrupts],
         }
     return {
         "status": "completed",
         "thread_id": thread_id,
-        "plan": result["plan"].model_dump(),
+        "plan": plan,
         "response": result.get("final_response", ""),
     }
+
+
+def run_graph(request: str, thread_id: str, graph=None) -> dict[str, object]:
+    graph = graph if graph is not None else get_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+    result = graph.invoke({"messages": [HumanMessage(content=request)]}, config=config)
+    return _summarize(thread_id, result)
+
+
+def resume_graph(thread_id: str, approved: bool, graph=None) -> dict[str, object]:
+    graph = graph if graph is not None else get_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = graph.get_state(config)
+    if not any(task.interrupts for task in snapshot.tasks):
+        raise NoPendingApprovalError(f"Thread {thread_id!r} has no action awaiting approval.")
+    result = graph.invoke(Command(resume={"approved": approved}), config=config)
+    return _summarize(thread_id, result)
