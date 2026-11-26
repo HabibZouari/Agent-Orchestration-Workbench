@@ -20,12 +20,13 @@ function StatusMark({ online }) {
   return <span className={`status-mark ${online ? "online" : "offline"}`} />;
 }
 
-function AgentRun({ health }) {
+function AgentRun({ health, onRunFinished }) {
   const [request, setRequest] = useState("");
   const [active, setActive] = useState(null);
   const [pollError, setPollError] = useState("");
   const [approvalToken, setApprovalToken] = useState("");
   const [approving, setApproving] = useState(false);
+  const distributed = health?.task_backend === "celery";
 
   const refresh = useCallback(async () => {
     if (!active?.task_id) return;
@@ -34,6 +35,7 @@ function AgentRun({ health }) {
       if (task.status === "SUCCESS") {
         setActive((current) => ({ ...current, outcome: task.result, status: "SUCCESS" }));
         setPollError("");
+        onRunFinished?.();
       } else if (task.status === "FAILURE") {
         setActive((current) => ({ ...current, status: "FAILURE" }));
         setPollError(task.error || "The background task failed. Check the API and worker logs.");
@@ -43,7 +45,7 @@ function AgentRun({ health }) {
     } catch (error) {
       setPollError(error.message);
     }
-  }, [active?.task_id]);
+  }, [active?.task_id, onRunFinished]);
 
   useEffect(() => {
     if (!active?.task_id || ["SUCCESS", "FAILURE"].includes(active.status)) return undefined;
@@ -109,7 +111,7 @@ function AgentRun({ health }) {
       <section className="panel request-panel">
         <div className="panel-heading">
           <div><span className="kicker">01 / EXPERIMENT</span><h2>Send a request</h2></div>
-          <span className="tag">OmniRoute · {health?.llm_model || "configured model"}</span>
+          <span className="tag">{health?.llm_model || "configured model"} · {health?.task_backend === "celery" ? "Celery" : "local runner"}</span>
         </div>
         <p className="muted">
           Try a general question, search your indexed sample documents, or ask to
@@ -155,7 +157,7 @@ function AgentRun({ health }) {
         {!active && !pollError && <div className="empty"><span>◌</span><strong>Nothing running yet</strong><p>Submit a request to see the plan and result here.</p></div>}
         {!active && pollError && (
           <div className="trace-content">
-            <div className="error-box"><strong>Could not start the agent run.</strong><p>{pollError}</p><p>Check that Redis Stack, FastAPI, and the Celery worker are running, then try again.</p></div>
+            <div className="error-box"><strong>Could not start the agent run.</strong><p>{pollError}</p><p>{distributed ? "Check that Redis Stack, FastAPI, and the Celery worker are running, then try again." : "Check the API window for errors, then try again."}</p></div>
           </div>
         )}
         {active && (
@@ -167,7 +169,7 @@ function AgentRun({ health }) {
             {!outcome && !pollError && (
               <div>
                 <p className="running"><span className="spinner" /> Waiting for the worker…</p>
-                {active.status === "PENDING" && active.submittedAt && Date.now() - active.submittedAt > 12000 && (
+                {distributed && active.status === "PENDING" && active.submittedAt && Date.now() - active.submittedAt > 12000 && (
                   <p className="worker-hint">Still queued after 12 seconds. The Celery worker may not be running; check the worker terminal started by the launcher.</p>
                 )}
               </div>
@@ -209,7 +211,7 @@ function AgentRun({ health }) {
               <div className="answer-box"><span className="kicker">AGENT RESPONSE</span><p>{outcome.response}</p></div>
             )}
             {pollError && <div className="error-box">{pollError}</div>}
-            {active.status === "FAILURE" && !pollError && <div className="error-box">The task failed. Check the API and worker logs.</div>}
+            {active.status === "FAILURE" && !pollError && <div className="error-box">The task failed. Check the {distributed ? "worker" : "API"} logs.</div>}
             {["SUCCESS", "FAILURE"].includes(active.status) && (
               <button className="text-button" onClick={() => { setActive(null); setPollError(""); }}>Clear run</button>
             )}
@@ -220,18 +222,36 @@ function AgentRun({ health }) {
   );
 }
 
-function Knowledge() {
-  const [documentId, setDocumentId] = useState("demo-policy");
+const STORE_LABELS = {
+  sqlite: "SQLite · FTS5 + vectors",
+  pgvector: "PostgreSQL · pgvector",
+};
+
+function Knowledge({ health, refreshKey }) {
+  const [documentId, setDocumentId] = useState("my-sample");
   const [content, setContent] = useState("");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null);
-  const [message, setMessage] = useState("");
+  const [documents, setDocuments] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  const loadDocuments = useCallback(async () => {
+    try {
+      setDocuments(await api("/documents"));
+    } catch (error) {
+      setNotice({ kind: "error", text: error.message });
+    }
+  }, []);
+
+  useEffect(() => {
+    loadDocuments();
+  }, [loadDocuments, refreshKey]);
 
   async function indexDocument(event) {
     event.preventDefault();
     setBusy(true);
-    setMessage("");
+    setNotice(null);
     try {
       const response = await api("/documents", {
         method: "PUT",
@@ -239,9 +259,11 @@ function Knowledge() {
           documents: [{ id: documentId.trim(), content: content.trim(), metadata: {} }],
         }),
       });
-      setMessage(`Indexed ${response.indexed} document. Try searching for it.`);
+      setNotice({ kind: "ok", text: `Indexed ${response.indexed} document. Try searching for it.` });
+      setContent("");
+      loadDocuments();
     } catch (error) {
-      setMessage(error.message);
+      setNotice({ kind: "error", text: error.message });
     } finally {
       setBusy(false);
     }
@@ -250,14 +272,14 @@ function Knowledge() {
   async function search(event) {
     event.preventDefault();
     setBusy(true);
-    setMessage("");
+    setNotice(null);
     try {
       setResults(await api("/search", {
         method: "POST",
         body: JSON.stringify({ query: query.trim(), top_k: 5 }),
       }));
     } catch (error) {
-      setMessage(error.message);
+      setNotice({ kind: "error", text: error.message });
     } finally {
       setBusy(false);
     }
@@ -267,7 +289,7 @@ function Knowledge() {
     <section className="panel knowledge-panel">
       <div className="panel-heading">
         <div><span className="kicker">03 / RAG SANDBOX</span><h2>Documents & hybrid search</h2></div>
-        <span className="tag">Local PostgreSQL + pgvector</span>
+        <span className="tag">{STORE_LABELS[health?.vector_store] || "Document store"}</span>
       </div>
       <p className="muted">
         Index a short, non-sensitive sample. The local embedding model downloads
@@ -301,7 +323,16 @@ function Knowledge() {
           </div>
         </div>
       </div>
-      {message && <p className={`notice ${message.includes("failed") || message.includes("Could not") ? "notice-error" : ""}`}>{message}</p>}
+      {notice && <p className={`notice ${notice.kind === "error" ? "notice-error" : ""}`}>{notice.text}</p>}
+      <div className="document-list">
+        <h3>Indexed documents {documents && <span>({documents.length})</span>}</h3>
+        {documents?.length === 0 && <p className="muted">No documents yet. Index one above.</p>}
+        <ul>
+          {documents?.map((doc) => (
+            <li key={doc.id}><code>{doc.id}</code><span>{doc.preview}</span></li>
+          ))}
+        </ul>
+      </div>
     </section>
   );
 }
@@ -309,6 +340,8 @@ function Knowledge() {
 export default function App() {
   const [health, setHealth] = useState(null);
   const [healthError, setHealthError] = useState("");
+  const [documentsVersion, setDocumentsVersion] = useState(0);
+  const refreshDocuments = useCallback(() => setDocumentsVersion((version) => version + 1), []);
 
   useEffect(() => {
     let active = true;
@@ -339,8 +372,8 @@ export default function App() {
     : health && !health.redis_search_available
       ? "Redis is running without its Search module. From the project folder run: docker compose up -d --force-recreate redis."
       : health && !health.worker_connected
-      ? "The Celery worker is not responding. Keep the worker window open and restart it with .\\Start-AgentLab.ps1."
-      : "";
+        ? "The Celery worker is not responding. Keep the worker window open or restart .\\Start-AgentLab.ps1."
+        : "";
   const connectionLabel = healthError
     ? "API offline"
     : runtimeIssue
@@ -366,9 +399,9 @@ export default function App() {
           <span className="kicker">LOCAL AGENT WORKBENCH</span>
           <h1>From request to <em>result.</em></h1>
           <p>Run a real agent task, understand the tool it chooses, and inspect what happened.</p>
-          {healthError && <div className="error-box api-error"><strong>FastAPI is not reachable.</strong> Start the API and Celery worker with <code>.\Start-AgentLab.ps1</code>. {healthError}</div>}
+          {healthError && <div className="error-box api-error"><strong>FastAPI is not reachable.</strong> Start the app with <code>.\Start-AgentLab.ps1</code>. {healthError}</div>}
           {runtimeIssue && <div className="error-box api-error"><strong>Agent services are not ready.</strong> {runtimeIssue}</div>}
-          {health && !health.llm_credential_configured && <div className="error-box api-error">Add your OmniRoute key to <code>LLM_API_KEY</code> in your private <code>.env</code> file, then restart the API.</div>}
+          {health && !health.llm_credential_configured && <div className="error-box api-error">Add your model provider key to <code>LLM_API_KEY</code> in your private <code>.env</code> file, then restart the API.</div>}
           {health && <div className="flow-strip">
             <div><span>01</span><b>Plan</b><small>Break down the request</small></div>
             <i>→</i><div><span>02</span><b>Act</b><small>Call a registered tool</small></div>
@@ -383,8 +416,8 @@ export default function App() {
           </div>
         ) : (
           <>
-            <AgentRun health={health} />
-            <Knowledge />
+            <AgentRun health={health} onRunFinished={refreshDocuments} />
+            <Knowledge health={health} refreshKey={documentsVersion} />
           </>
         )}
         <section className="capabilities">
